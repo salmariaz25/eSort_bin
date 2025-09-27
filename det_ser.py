@@ -6,11 +6,11 @@ import torch.nn.functional as F
 import numpy as np
 from torchvision import transforms, models
 
-MODEL_PATH = "C:/Users/salma/OneDrive/Desktop/images_sort_bin/eSort_class_best.pt"
-COM_PORT = "COM6"
+MODEL_PATH = "/home/salma/Desktop/esort/eSort_bin/eSort_efnclass_best.pt"
+COM_PORT = "/dev/ttyACM0"
 BAUDRATE = 115200
 
-CLASS_NAMES = ['biodegradable','hazardous','nonrecyclable','papers','recyclable']
+CLASS_NAMES = ['background','biodegradable','hazardous','nonrecyclable','papers','recyclable']
 
 # Map class -> Arduino command
 CLASS_TO_CMD = {
@@ -23,18 +23,16 @@ CLASS_TO_CMD = {
 
 SKIP_HAZARDOUS_SEND = False   # If True, will NOT send any serial command for hazardous items.
 
-CENTER_RATIO = 0.70       # center crop bounding box ratio (0.0-1.0)
-CONF_THRESHOLD = 0.83     # accept detection when probability >= this
-COOLDOWN_S = 1.0          # seconds after DONE before allowing next send
-SERIAL_TIMEOUT_S = 8.0    # how long to wait for DONE from Arduino
-SHOW_WINDOW = True
+CENTER_RATIO = 0.70
+CONF_THRESHOLD = 0.83
+COOLDOWN_S = 3.0
+SERIAL_TIMEOUT_S = 8.0
+SHOW_WINDOW = False            # <<< HEADLESS MODE
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Hazard-clear tuning:
-HAZARD_CLEAR_FRAMES = 6   # number of consecutive frames that must NOT show hazardous before sending CLEAR
-# ----------------------------------------------------
+HAZARD_CLEAR_FRAMES = 6
 
-# Preprocess (EfficientNet-B0 style)
+# Preprocess
 preprocess = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize(224),
@@ -45,9 +43,8 @@ preprocess = transforms.Compose([
 
 def open_serial(port, baud, timeout=1.0):
     try:
-        ser = serial.Serial(port, baud, timeout=0.5)  # short timeout for reads
-        time.sleep(2.0)  # allow Arduino to reset
-        # flush startup prints
+        ser = serial.Serial(port, baud, timeout=0.5)
+        time.sleep(2.0)
         try:
             while ser.in_waiting:
                 _ = ser.readline()
@@ -61,7 +58,7 @@ def open_serial(port, baud, timeout=1.0):
 
 def load_classifier(path, num_classes):
     print("[MODEL] Loading", path)
-    net = models.efficientnet_b0(pretrained=False)
+    net = models.efficientnet_b0(weights=None)
     try:
         if isinstance(net.classifier, torch.nn.Sequential):
             in_f = net.classifier[1].in_features
@@ -82,13 +79,11 @@ def load_classifier(path, num_classes):
             new_state = {k.replace('module.','') if k.startswith('module.') else k: v for k,v in state.items()}
             net.load_state_dict(new_state, strict=False)
         else:
-            # treat as raw state_dict
             sample = list(ckpt.items())[:1]
             if sample and isinstance(sample[0][1], torch.Tensor):
                 new_state = {k.replace('module.','') if k.startswith('module.') else k: v for k,v in ckpt.items()}
                 net.load_state_dict(new_state, strict=False)
             else:
-                # try full model object
                 try:
                     ckpt.eval()
                     return ckpt
@@ -126,16 +121,9 @@ def center_crop(frame, ratio):
     return frame[y1:y2, x1:x2], (x1,y1,x2,y2)
 
 def send_and_wait_done(ser, cmd, timeout_s=SERIAL_TIMEOUT_S, expect_done=True):
-    """
-    Send `cmd` (like 'C:2') and wait for Arduino reply.
-    If expect_done==True: wait for 'DONE' (returns True on DONE).
-    If expect_done==False: wait for 'RECEIVED' only (returns True if RECEIVED seen).
-    Returns True on expected ack, False otherwise.
-    """
     if ser is None:
         print("[SERIAL] Serial not open — dry-run: would send", cmd)
         return False
-
     try:
         ser.reset_input_buffer()
     except Exception:
@@ -167,7 +155,6 @@ def send_and_wait_done(ser, cmd, timeout_s=SERIAL_TIMEOUT_S, expect_done=True):
                 return True
         if "DONE" in line:
             return True
-    # timed out
     if not expect_done:
         print("[TIMEOUT] No RECEIVED received for", cmd)
     else:
@@ -194,9 +181,8 @@ def main():
             print("No camera frame. Exiting.")
             break
 
-        crop, (x1,y1,x2,y2) = center_crop(frame, CENTER_RATIO)
+        crop, _ = center_crop(frame, CENTER_RATIO)
 
-        # classify crop
         try:
             idx, probs = classify_image(model, crop)
             classname = CLASS_NAMES[idx]
@@ -208,22 +194,21 @@ def main():
 
         now = time.time()
 
-        # overlay
-        cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
+        
         if classname is None or prob < CONF_THRESHOLD:
-            cv2.putText(frame, "No item detected", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255),2)
+            if not SHOW_WINDOW:
+                print("[CLASSIFIER] No item detected")
         else:
-            cv2.putText(frame, f"{classname} {prob:.2f}", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0),2)
+            if not SHOW_WINDOW:
+                print(f"[CLASSIFIER] {classname} ({prob:.2f})")
 
-        # Hazard handling: if hazard pending wait for clear condition
+        # Hazard handling
         if hazard_pending:
-            # if current frame is NOT hazardous (either different class or below threshold)
             if not (classname == 'hazardous' and prob >= CONF_THRESHOLD):
                 non_hazard_frames += 1
             else:
                 non_hazard_frames = 0
 
-            # once we've seen N consecutive non-hazard frames, send CLEAR
             if non_hazard_frames >= HAZARD_CLEAR_FRAMES:
                 print("[HAZARD] No hazardous seen for", non_hazard_frames, "frames -> sending CLEAR")
                 ok = send_and_wait_done(ser, "CLEAR", timeout_s=SERIAL_TIMEOUT_S, expect_done=True)
@@ -234,17 +219,18 @@ def main():
                     print("[HAZARD] Cleared (Arduino DONE). Resuming normal ops.")
                 else:
                     print("[HAZARD] CLEAR timed out or failed. Will retry after more frames.")
-                    
-            
-            # show status in terminal
+
+            if not SHOW_WINDOW:
+                print("[HAZARD MODE] Hazardous detected – waiting for safe frames...")
+
             if SHOW_WINDOW:
-                cv2.putText(frame, "HAZARD MODE - wait to clear", (20,80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255),2)
-            if SHOW_WINDOW:
+                cv2.putText(frame, "HAZARD MODE - wait to clear", (20,80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255),2)
                 cv2.imshow("eSort Classifier", frame)
                 k = cv2.waitKey(10) & 0xFF
                 if k == ord('q') or k == 27:
                     break
-            continue  # go next frame loop without sending other commands
+            continue
 
         # Normal decision 
         if classname is not None and prob >= CONF_THRESHOLD and (now - last_done_time) > COOLDOWN_S:
@@ -257,14 +243,13 @@ def main():
                         last_done_time = time.time()
                     else:
                         cmd = CLASS_TO_CMD[classname]
-                        print(f"[ACTION] Detected hazardous ({prob:.2f}) -> sending {cmd} (expect RECEIVED, wait for CLEAR later)")
+                        print(f"[ACTION] Detected hazardous ({prob:.2f}) -> sending {cmd}")
                         ok = send_and_wait_done(ser, cmd, timeout_s=4.0, expect_done=False)
                         if ok:
                             hazard_pending = True
                             non_hazard_frames = 0
                             print("[HAZARD] Hazard acknowledged by Arduino (RECEIVED). Waiting for CLEAR.")
                         else:
-                            # failed to get RECEIVED - report but do not set hazard_pending
                             print("[WARN] Hazard command write failed or no RECEIVED - try again later.")
                 else:
                     cmd = CLASS_TO_CMD[classname]
@@ -276,7 +261,6 @@ def main():
                     else:
                         print("[WARN] No DONE ack — check Arduino or connection.")
 
-        # show frame and key handling
         if SHOW_WINDOW:
             cv2.imshow("eSort Classifier", frame)
             k = cv2.waitKey(10) & 0xFF
