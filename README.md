@@ -29,7 +29,7 @@
 5. *Finally run the python file:*
    python det_ser.py
 
-**How to use system:**
+**How to use the system:**
 1. *Normal Operation:*
     Place waste item on the sorting tray
     System automatically classifies the item
