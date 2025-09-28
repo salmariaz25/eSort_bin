@@ -47,4 +47,4 @@
 Training images available at:
 https://drive.google.com/file/d/17teKqaoHH-SfliOGdDCh_gxPFrUg186u/view?usp=drive_link
 
-**Demo Video link:** 
+**Demo Video link:** https://youtube.com/shorts/lXJs67SWHkw?feature=share
